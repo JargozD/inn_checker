@@ -1,0 +1,6 @@
+FROM php:fpm
+
+RUN apt-get update && apt-get install -y librdkafka-dev
+RUN pecl install rdkafka && docker-php-ext-enable rdkafka
+
+CMD ["php-fpm"]
