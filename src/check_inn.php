@@ -1,81 +1,99 @@
 <?php
+require __DIR__ . '/../vendor/autoload.php';
 
-$conf = new RdKafka\Conf();
+use Dadata\DadataClient;
+use RdKafka\Conf;
+use RdKafka\KafkaConsumer;
 
-$conf->set('metadata.broker.list', getenv('KAFKA_CONN'));
+/**
+ * Класс получает из очереди Kafka список ИНН для обработки.
+ * Для каждого ИНН производится обращение в сервис Dadata для получения данных о юр.лице, 
+ * которые сохраняются в файл `./inns/{ИНН}.txt`
+ */
+class CheckInn
+{
+    private KafkaConsumer $consumer;
 
-$conf->set('group.id', getenv('KAFKA_GROUP_NAME'));
+    private DadataClient $dadata;
 
-$conf->set('auto.offset.reset', 'earliest');
+    public function __construct()
+    {
+        $conf = new Conf();
+        $conf->set('metadata.broker.list', getenv('KAFKA_CONN'));
+        $conf->set('group.id', getenv('KAFKA_GROUP_NAME'));
+        $conf->set('auto.offset.reset', 'earliest');
+        $conf->set('enable.partition.eof', 'true');
 
-$conf->set('enable.partition.eof', 'true');
+        $this->consumer = new KafkaConsumer($conf);
+        $this->consumer->subscribe([getenv('KAFKA_TOPIC_NAME')]);
 
-$consumer = new RdKafka\KafkaConsumer($conf);
+        $this->dadata = new DadataClient(
+            getenv('DADATA_API_KEY'),
+            getenv('DADATA_SECRET_KEY')
+        );
+    }
 
-$consumer->subscribe([getenv('KAFKA_TOPIC_NAME')]);
+    public function __destruct()
+    {
+        $this->consumer->close();
+    }
 
-echo "Начало обработки данных" . PHP_EOL;
+    /**
+     * Обработка данных из очереди
+     */
+    public function execute()
+    {
+        echo "Начало обработки данных" . PHP_EOL;
 
-$count = 0;
+        $count = 0;
 
-while ($msg = $consumer->consume(5000)) {
-    switch ($msg->err) {
-        case RD_KAFKA_RESP_ERR_NO_ERROR:
-            if (!empty($msg->payload)) {
-                $data = getData($msg->payload);
-                if ($data) {
-                    saveData($msg->payload, $data);
-                    $count++;
+        while ($msg = $this->consumer->consume(5000)) {
+            switch ($msg->err) {
+                case RD_KAFKA_RESP_ERR_NO_ERROR:
+                    if (!empty($msg->payload)) {
+                        $data = $this->getData($msg->payload);
+                        if ($data) {
+                            $this->saveData($msg->payload, $data);
+                            $count++;
 
-                    echo "Данные по ИНН успешно записаны в файл '$msg->payload'.\n";
-                }
+                            echo "Данные по ИНН успешно записаны в файл '$msg->payload'.\n";
+                        }
+                    }
+                    break;
+                case RD_KAFKA_RESP_ERR__PARTITION_EOF:
+                    break 2;
+                case RD_KAFKA_RESP_ERR__TIMED_OUT:
+                    echo "Тайм-аут\n";
+                    break;
+                default:
+                    throw new \Exception($msg->errstr(), $msg->err);
+                    break;
             }
-            break;
-        case RD_KAFKA_RESP_ERR__PARTITION_EOF:
-            break 2;
-        case RD_KAFKA_RESP_ERR__TIMED_OUT:
-            echo "Тайм-аут\n";
-            break;
-        default:
-            throw new \Exception($msg->errstr(), $msg->err);
-            break;
+        }
+
+        echo "Обработано $count сообщений." . PHP_EOL;
+    }
+
+    /**
+     * Получает данные из сервиса Dadata по ИНН юридического лица
+     */
+    private function getData($inn)
+    {
+        $result = $this->dadata->suggest('party', $inn, 1, ['type' => 'LEGAL']);
+
+        return $result ?? [];
+    }
+
+    /**
+     * Сохраняет данные по ИНН в файл ./inns/{ИНН}.txt
+     */
+    private function saveData($inn, $data)
+    {
+        $fileName = __DIR__ . '/../inns/' . $inn . ".txt";
+        file_put_contents($fileName, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
     }
 }
 
-$consumer->close();
 
-echo "Обработано $count сообщений." . PHP_EOL;
-
-/**
- * Получает данные из сервиса Dadata по ИНН юридического лица
- */
-function getData($inn)
-{
-    $opts = [
-        'http' => [
-            'method' => "GET",
-            'header' => "Authorization: Token " . getenv('DADATA_API_KEY') . "\r\n" .
-                "Content-Type: application/json\r\n" .
-                "Accept: application/json\r\n"
-        ]
-    ];
-
-    $result = file_get_contents(
-        "http://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party?query=$inn&type=LEGAL",
-        false,
-        stream_context_create($opts)
-    );
-
-    $result = $result ? json_decode($result, true) : [];
-
-    return $result['suggestions'] ?? [];
-}
-
-/**
- * Сохраняет данные по ИНН в файл ./inns/{ИНН}.txt
- */
-function saveData($inn, $data)
-{
-    $fileName = __DIR__ . '/../inns/' . $inn . ".txt";
-    file_put_contents($fileName, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
-}
+$obj = new CheckInn();
+$obj->execute();
